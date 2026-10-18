@@ -1,8 +1,9 @@
 import json
+import re
 from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import re
+import traceback
 
 app = FastAPI()
 
@@ -24,82 +25,95 @@ except Exception:
     raw_orders = []
     USD_PER_UNIT = {"USD": 1.0, "INR": 0.011, "EUR": 1.09}
 
-# 1. Deduplicate: Keep row with latest updated_at per order id
+# Deduplicate: Keep row with latest updated_at per order id
 current_orders = {}
 for o in raw_orders:
     oid = o["id"]
     if oid not in current_orders or o["updated_at"] > current_orders[oid]["updated_at"]:
         current_orders[oid] = o
 
+def parse_date(ts):
+    if ts.endswith("Z"):
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return datetime.fromisoformat(ts)
+
 @app.post("/answer")
 async def answer(request: Request):
-    body = await request.json()
-    question = body.get("question", "")
-    
-    q = question.lower()
-    
-    # Helper to parse date
-    def parse_date(ts):
-        if ts.endswith("Z"):
-            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return datetime.fromisoformat(ts)
+    try:
+        body = await request.json()
+        question = body.get("question", "")
+        q = question.lower()
 
-    # --- LOGIC 1: REVENUE ---
-    if "revenue" in q:
+        # --- 1. Extract Filters ---
+        
+        # Region
         region_match = re.search(r'(north|south|east|west|central)', q)
         region = region_match.group(1).capitalize() if region_match else None
-        
+
+        # Month
         month_match = re.search(r'(january|february|march|april|may|june|july|august|september|october|november|december)', q)
         months = {"january":1, "february":2, "march":3, "april":4, "may":5, "june":6, "july":7, "august":8, "september":9, "october":10, "november":11, "december":12}
         month = months.get(month_match.group(1)) if month_match else None
-        
+
+        # Year
         year_match = re.search(r'202\d', q)
         year = int(year_match.group(0)) if year_match else None
 
-        total_usd = 0.0
+        # Status (Only apply if explicitly mentioned)
+        status = None
+        if "refund" in q:
+            status = "refunded"
+        elif "void" in q:
+            status = "void"
+        elif "paid" in q:
+            status = "paid"
+
+        # Product
+        product_match = re.search(r'(blender|toaster|kettle|juicer|grinder|rice cooker|air fryer|mixer)', q)
+        product = product_match.group(1).lower() if product_match else None
+
+        # --- 2. Filter the Data ---
+        filtered_orders = []
         for o in current_orders.values():
-            # Rule: Only 'paid' counts as revenue
-            if o["status"] != "paid":
-                continue
+            # If status is specified in the question, filter by it. Otherwise, default to 'paid' for revenue, or include all for counts.
+            if status:
+                if o["status"] != status:
+                    continue
+            elif "revenue" in q or "total" in q:
+                if o["status"] != "paid":
+                    continue
+
             if region and o["region"].lower() != region.lower():
                 continue
-                
+            
+            if product and o["product"].lower() != product:
+                continue
+
             dt = parse_date(o["created_at"])
             if month and dt.month != month:
                 continue
             if year and dt.year != year:
                 continue
-                
-            rate = USD_PER_UNIT.get(o["currency"], 1.0)
-            total_usd += (o["amount"] * rate)
             
-        return {"answer": round(total_usd, 2)}
+            filtered_orders.append(o)
 
-    # --- LOGIC 2: REFUNDS ---
-    if "refund" in q:
-        total_usd = 0.0
-        for o in current_orders.values():
-            if o["status"] == "refunded":
+        # --- 3. Determine Operation ---
+        
+        # Count vs Sum
+        is_count = any(w in q for w in ["count", "how many", "number of"])
+        
+        if is_count:
+            return {"answer": len(filtered_orders)}
+            
+        else:
+            # Sum (Revenue / Amount)
+            total_usd = 0.0
+            for o in filtered_orders:
                 rate = USD_PER_UNIT.get(o["currency"], 1.0)
                 total_usd += (o["amount"] * rate)
-        return {"answer": round(total_usd, 2)}
+            return {"answer": round(total_usd, 2)}
 
-    # --- LOGIC 3: PRODUCT COUNTS / QUANTITIES ---
-    products = ["blender", "toaster", "kettle", "juicer", "grinder", "rice cooker", "air fryer", "mixer"]
-    for p in products:
-        if p in q:
-            total_qty = 0
-            for o in current_orders.values():
-                if o["product"].lower() == p and o["status"] == "paid":
-                    total_qty += o["qty"]
-            return {"answer": total_qty}
-
-    # --- LOGIC 4: UNIQUE CUSTOMERS ---
-    if "customer" in q:
-        unique_customers = set()
-        for o in current_orders.values():
-            if o["status"] == "paid":
-                unique_customers.add(o["customer"])
-        return {"answer": len(unique_customers)}
-
-    return {"answer": "Question not understood."}
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        print(error_msg)
+        return {"error": str(e), "details": error_msg}
